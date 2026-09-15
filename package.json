@@ -23,6 +23,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "node --test",
     "release": "npm run build && npm version patch && git push --follow-tags && npm publish"
   },
   "keywords": [

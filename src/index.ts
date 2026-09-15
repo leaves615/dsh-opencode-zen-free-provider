@@ -308,6 +308,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       requestImageMaxBytes: 1_048_576,
       retryPolicy: resolveRetryPolicy(opts.retryPolicy, `${name}: retryPolicy`),
       piProvider,
+      modelErrors: new Map(),
       configuredMaxTokens: new Map(),
     }]])
     return profiles
