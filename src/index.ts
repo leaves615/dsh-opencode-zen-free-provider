@@ -6,8 +6,8 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
-import { createHash } from 'node:crypto'
-import { createProvider, type AuthContext, type Context as PiContext, type CredentialStore, type Model, type SimpleStreamOptions, type ThinkingLevelMap, type ProviderStreams } from '@earendil-works/pi-ai'
+import { createHash, randomBytes } from 'node:crypto'
+import { createProvider, type AuthContext, type Context as PiContext, type CredentialStore, type Model, type SimpleStreamOptions, type ThinkingLevelMap, type ProviderStreams, type Tool, type TSchema } from '@earendil-works/pi-ai'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 // Cloned (and minimized) from @earendil-works/pi-ai's openai-completions module.
 // See src/openai-completions.ts for the source URL + the only change (zenFetch).
@@ -30,6 +30,15 @@ const NS = 'opencode-zen-free-provider'
 /** Latest CLI version, read off unpkg's `@latest` redirect via the package's own `package.json`. */
 const OPENCODE_VERSION_URL = 'https://unpkg.com/opencode-ai@latest/package.json'
 const OPENCODE_VERSION_FALLBACK = '1.18.18'
+// Remaining tokens of the opencode CLI User-Agent fingerprint. Deliberately
+// spoofed: dsh runs on Node, but the Zen free-tier gate expects the Bun/AI SDK
+// identity opencode ships. Bump alongside the resolved CLI version.
+// Verified against opencode 1.18.31 binary: provider-utils is 4.0.23, bun 1.3.14.
+const OPENCODE_AI_SDK_PROVIDER_UTILS_VERSION = '4.0.23'
+const OPENCODE_BUN_VERSION = '1.3.14'
+
+export const opencodeUserAgentFor = (version: string): string =>
+  `opencode/${version} ai-sdk/provider-utils/${OPENCODE_AI_SDK_PROVIDER_UTILS_VERSION} runtime/bun/${OPENCODE_BUN_VERSION}`
 
 /** Envelope types that must stay AUTH-classified instead of being rewritten. */
 const AUTH_ERROR_TYPES = new Set(['AuthError', 'authentication_error', 'invalid_api_key', 'unauthorized'])
@@ -37,10 +46,13 @@ const AUTH_ERROR_TYPES = new Set(['AuthError', 'authentication_error', 'invalid_
 export interface Config {
   /** Provider-owned model-request retry policy; omission uses normal defaults. */
   retryPolicy?: RetryPolicyConfig
+  /** Strip replayed reasoning.encrypted_content before requests hit the Zen gateway. */
+  stripReasoningEncryptedContent?: boolean
 }
 
 export const Config: z<Config> = z.object({
   retryPolicy: RetryPolicySchema,
+  stripReasoningEncryptedContent: z.boolean().default(true),
 })
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -55,41 +67,183 @@ const resolveOpenCodeVersion = async (): Promise<string> => {
   }
 }
 
-const opencodeId = (prefix: 'ses' | 'msg', value: string): string => {
-  const digest = createHash('sha256').update(`dsh-opencode-${prefix}\0${value}`).digest()
-  const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-  let number = BigInt(`0x${digest.toString('hex')}`)
-  let encoded = ''
-  while (number > 0) {
-    encoded = alphabet[Number(number % 62n)] + encoded
-    number /= 62n
+const OPENCODE_ID_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+
+// `msg_`: opencode CLI's own request-id generator — the low 48 bits of
+// `Date.now() << 12 | counter` as six big-endian bytes, then 14 random base62
+// chars. Generated fresh per request; the counter disambiguates ids minted in
+// the same millisecond.
+let opencodeLastTimestamp = 0
+let opencodeTimestampCounter = 0
+export const opencodeRequestId = (): string => {
+  const timestamp = Date.now()
+  opencodeTimestampCounter = timestamp === opencodeLastTimestamp ? opencodeTimestampCounter + 1 : 1
+  opencodeLastTimestamp = timestamp
+  const value = BigInt(timestamp) * 0x1000n + BigInt(opencodeTimestampCounter)
+  let time = ''
+  for (let index = 0; index < 6; index += 1) {
+    time += Number((value >> BigInt(40 - 8 * index)) & 0xffn).toString(16).padStart(2, '0')
   }
-  while (encoded.length < 14) encoded = `0${encoded}`
-  return `${prefix}_${digest.toString('hex').slice(0, 12)}${encoded.slice(0, 14)}`
+  const random = [...randomBytes(14)].map(byte => OPENCODE_ID_ALPHABET[byte % 62]).join('')
+  return `msg_${time}${random}`
 }
 
-const lastUserContent = (context: PiContext): string => {
-  for (let index = context.messages.length - 1; index >= 0; index -= 1) {
-    const message = context.messages[index]
-    if (message.role !== 'user') continue
-    if (typeof message.content === 'string') return message.content
-    return message.content.map(part => part.type === 'text' ? part.text : part.data).join('\0')
-  }
-  return ''
+// `ses_`: a pure mapping from the dsh session id, so the same dsh session keeps
+// the same opencode session id forever without any cache (a cache could evict
+// and silently re-mint it). Only the shape matches opencode
+// (`ses_` + 12 hex + 14 base62); the 12 hex is digest material, not a clock,
+// because the gateway does not validate that half as a timestamp.
+export const opencodeSessionId = (sessionId: string): string => {
+  const digest = createHash('sha256').update(`dsh-opencode-ses\0${sessionId}`).digest()
+  const time = digest.toString('hex').slice(0, 12)
+  const random = [...digest.subarray(6, 20)].map(byte => OPENCODE_ID_ALPHABET[byte % 62]).join('')
+  return `ses_${time}${random}`
 }
 
-const zenApiHeaders = (model: Pick<Model<ZenApi>, 'headers'>, context: PiContext, options: SimpleStreamOptions) => {
+export const zenApiHeaders = (model: Pick<Model<ZenApi>, 'headers'>, options: SimpleStreamOptions) => {
   const sessionId = options.sessionId ?? 'dsh-session-unknown'
-  const requestSeed = `${sessionId}\0${lastUserContent(context)}`
+  // Match real opencode CLI headers exactly (captured from 1.18.31 binary):
+  // - no HTTP-Referer (actively stripped: model defs may still carry one)
+  // - accept: */*
+  // - accept-encoding: gzip, deflate, br, zstd
+  // - x-opencode-* headers
+  const { 'HTTP-Referer': _droppedReferer, ...modelHeaders } = model.headers ?? {}
+  void _droppedReferer
   return {
-    ...model.headers,
-    'HTTP-Referer': 'https://opencode.ai',
+    ...modelHeaders,
+    accept: '*/*',
+    'accept-encoding': 'gzip, deflate, br, zstd',
     'x-opencode-project': 'global',
-    'x-opencode-session': opencodeId('ses', sessionId),
-    'x-opencode-request': opencodeId('msg', requestSeed),
+    'x-opencode-session': opencodeSessionId(sessionId),
+    'x-opencode-request': opencodeRequestId(),
     'x-opencode-client': 'cli',
   }
 }
+
+// Zen rejects replayed reasoning.encrypted_content: stale or foreign ciphertext
+// fails pairing validation at the gateway, so history must go out clean (G2:
+// drop the whole reasoning item, keep the visible text + tool calls). Never
+// gated on model.reasoning: replay happens regardless of effort control,
+// and a Responses-history thinking block replayed into a Completions model
+// would otherwise land as a garbage assistantMsg[json] field.
+const isJsonSignature = (signature: unknown): boolean => {
+  if (typeof signature !== 'string') return false
+  const trimmed = signature.trim()
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return false
+  try { JSON.parse(trimmed); return true } catch { return false }
+}
+
+const isResponsesReasoningItem = (signature: unknown): boolean => {
+  if (typeof signature !== 'string') return false
+  const trimmed = signature.trim()
+  if (!trimmed.startsWith('{')) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(trimmed) } catch { return false }
+  return isRecord(parsed) && (parsed.type === 'reasoning' || 'encrypted_content' in parsed)
+}
+
+export const stripReasoningEncryptedContent = (context: PiContext): PiContext => ({
+  ...context,
+  messages: context.messages.map((message) => {
+    if (message.role !== 'assistant') return message
+    const content = message.content.flatMap((block) => {
+      // Responses reasoning items (thinkingSignature = serialized reasoning
+      // item incl. encrypted_content): drop the whole block, keep siblings.
+      if (block.type === 'thinking' && isJsonSignature(block.thinkingSignature)) {
+        if (isResponsesReasoningItem(block.thinkingSignature)) return []
+        // Completions reasoning_details (JSON array / encrypted detail): keep
+        // the visible thinking text, drop only the opaque signature so the
+        // transport falls back to plain content (+ the reasoning_content
+        // marker applied below) instead of a garbage field name.
+        const next = { ...block }
+        delete next.thinkingSignature
+        return [next]
+      }
+      // Completions tool-call thought signatures replay as reasoning_details.
+      if (block.type === 'toolCall' && typeof (block as { thoughtSignature?: unknown }).thoughtSignature === 'string') {
+        const next = { ...(block as unknown as Record<string, unknown>) }
+        delete next.thoughtSignature
+        return [next as unknown as typeof block]
+      }
+      return [block]
+    })
+    return { ...message, content }
+  }),
+})
+
+// The cloned Responses transport sets params.include =
+// [reasoning.encrypted_content] whenever reasoning is requested; that asks Zen
+// to mint fresh ciphertext. Scrub it post-merge (buildParams already folded
+// samplingParams in by the time onPayload runs, so this one hook covers both)
+// while preserving a caller-provided onPayload.
+const REASONING_ENCRYPTED_INCLUDE = 'reasoning.encrypted_content'
+
+export const withStrippedResponsesInclude = (options: SimpleStreamOptions): SimpleStreamOptions => {
+  const inner = options.onPayload
+  const scrub = (params: unknown): void => {
+    if (!isRecord(params) || !Array.isArray(params.include)) return
+    const kept = (params.include as unknown[]).filter((value) => value !== REASONING_ENCRYPTED_INCLUDE)
+    if (kept.length === (params.include as unknown[]).length) return
+    if (kept.length === 0) delete params.include
+    else params.include = kept
+  }
+  return {
+    ...options,
+    onPayload: async (params, model) => {
+      if (inner === undefined) {
+        scrub(params)
+        return undefined
+      }
+      const replaced = await inner(params, model)
+      if (replaced === undefined) {
+        scrub(params)
+        return undefined
+      }
+      scrub(replaced)
+      return replaced
+    },
+  }
+}
+
+// Live switch for the strip (module-level so the per-request stream closures
+// below always see current settings; synced from Config in apply()).
+let stripEncryptedContentEnabled = true
+
+// Strip first, then mark: kept thinking blocks with a cleared signature get
+// the reasoning_content marker below via the undefined-signature path.
+export const prepareZenContext = (context: PiContext, enabled: boolean = stripEncryptedContentEnabled): PiContext =>
+  enabled ? normalizeReasoningContext(stripReasoningEncryptedContent(context)) : normalizeReasoningContext(context)
+
+export const maybeStripResponsesInclude = (options: SimpleStreamOptions, enabled: boolean = stripEncryptedContentEnabled): SimpleStreamOptions =>
+  enabled ? withStrippedResponsesInclude(options) : options
+
+// The anonymous free tier only serves agent-shaped streaming requests: the
+// cloned transports always send `stream: true`, but the core agent tools must
+// also be present — anything else is rejected with 403 FreeTierError. Mirror
+// opencode2api: synthesize minimal defs for whichever core tools the caller
+// did not declare; declared tools are left untouched. Key-tier requests keep
+// their original bodies (gated by userKeyPresent below).
+const ANONYMOUS_CORE_TOOLS = ['bash', 'edit', 'glob', 'grep', 'read'] as const
+
+const agentToolFor = (name: string): Tool => ({
+  name,
+  description: `Agent tool ${name}`,
+  parameters: { type: 'object', properties: {} } as unknown as TSchema,
+})
+
+export const ensureAgentTools = (context: PiContext): PiContext => {
+  const present = new Set((context.tools ?? []).map(tool => tool.name))
+  const missing = ANONYMOUS_CORE_TOOLS.filter(name => !present.has(name))
+  if (missing.length === 0) return context
+  return { ...context, tools: [...(context.tools ?? []), ...missing.map(agentToolFor)] }
+}
+
+// Latched by resolveApiKey once a real user credential resolves: from then on
+// this mount serves the key tier, which must keep original bodies.
+let userKeyPresent = false
+
+export const maybeEnsureAgentTools = (context: PiContext): PiContext =>
+  userKeyPresent ? context : ensureAgentTools(context)
 
 // Replayed thinking blocks carry no wire signature; marking them
 // `reasoning_content` keeps the transport from mangling history. Never gated on
@@ -158,15 +312,15 @@ type ZenApi = 'openai-completions' | 'openai-responses'
 const zenStreamFor = (api: ZenApi): ProviderStreams => api === 'openai-responses'
   ? {
     stream: (model: Model<'openai-responses'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piResponsesStream({ ...model, headers: zenApiHeaders(model, context, options) }, normalizeReasoningContext(context), options)),
+      sanitizeStream(piResponsesStream({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), maybeStripResponsesInclude(options))),
     streamSimple: (model: Model<'openai-responses'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piResponsesStreamSimple({ ...model, headers: zenApiHeaders(model, context, options) }, normalizeReasoningContext(context), options)),
+      sanitizeStream(piResponsesStreamSimple({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), maybeStripResponsesInclude(options))),
   } as unknown as ProviderStreams
   : {
     stream: (model: Model<'openai-completions'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piAgentStream({ ...model, headers: zenApiHeaders(model, context, options) }, normalizeReasoningContext(context), options)),
+      sanitizeStream(piAgentStream({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), options)),
     streamSimple: (model: Model<'openai-completions'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piAgentStreamSimple({ ...model, headers: zenApiHeaders(model, context, options) }, normalizeReasoningContext(context), options)),
+      sanitizeStream(piAgentStreamSimple({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), options)),
   }
 
 const zenApi: Partial<Record<ZenApi, ProviderStreams>> = {
@@ -260,7 +414,7 @@ function buildModels(
         api,
         provider: PROVIDER,
         baseUrl: 'https://opencode.ai/zen/v1',
-        headers: { 'User-Agent': userAgent, 'HTTP-Referer': 'https://opencode.ai' },
+        headers: { 'User-Agent': userAgent },
         reasoning: controllable,
         ...(controllable ? { thinkingLevelMap: reasoningMapFor(levels, api) } : {}),
         input: input.length > 0 ? input : ['text'],
@@ -276,9 +430,16 @@ function buildModels(
 export async function apply(ctx: Context, config: Config): Promise<void> {
   // One-time: the Zen user-agent the cloned transports force on every request.
   const opencodeVersion = await resolveOpenCodeVersion()
-  const opencodeUserAgent = `opencode/${opencodeVersion}`
+  const opencodeUserAgent = opencodeUserAgentFor(opencodeVersion)
   installZenUserAgent(opencodeUserAgent)
   installZenUserAgentResponses(opencodeUserAgent)
+
+  // Sync the module-level strip switch with settings. Default true so a
+  // missing key (e.g. an old settings snapshot) keeps stripping on.
+  const syncStripSwitch = (cfg: Config): void => {
+    stripEncryptedContentEnabled = cfg.stripReasoningEncryptedContent ?? true
+  }
+  syncStripSwitch(config)
 
   let current: () => Config = () => config
   // Outside the settings-backed config, so a settings snapshot cannot clobber a
@@ -326,7 +487,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const credentials = ctx.get('credentials')
       if (credentials !== undefined) {
         const hit = await credentials.resolve(profile.apiKeyEnv!)
-        if (hit !== undefined) return assertUsableApiKey(hit.value, name, String(profile.apiKeyEnv))
+        if (hit !== undefined) {
+          const key = assertUsableApiKey(hit.value, name, String(profile.apiKeyEnv))
+          userKeyPresent = true
+          return key
+        }
       }
       // OpenCode Zen accepts the public route without a user API key.
       return 'public'
@@ -342,8 +507,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     settingsCtx.settings.installSection(ctx, NS, Config, config, {
       setSource: (source) => {
         current = source
+        syncStripSwitch(source())
       },
       onChange: () => {
+        syncStripSwitch(current())
         profiles = buildProfiles()
       },
     })
