@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ensureAgentTools, maybeEnsureAgentTools } from '../lib/index.js'
+import { ensureAgentTools, maybeEnsureAgentTools, prepareZenContext, transcriptToContext } from '../lib/index.js'
 
 const CORE = ['bash', 'edit', 'glob', 'grep', 'read']
 
@@ -48,4 +48,25 @@ test('input context is not mutated', () => {
 test('maybeEnsureAgentTools shapes while anonymous (no key seen)', () => {
   const out = maybeEnsureAgentTools({ messages: [], tools: [] })
   assert.deepEqual(out.tools.map(t => t.name), CORE)
+})
+
+test('0.87 boundary: tools are restored from the transcript system message', () => {
+  const read = userTool('read')
+  const transcript = {
+    messages: [
+      { role: 'system', content: '', toolsAdded: [read], timestamp: 0 },
+      { role: 'user', content: 'hi' },
+    ],
+  }
+  const restored = transcriptToContext(transcript)
+  assert.deepEqual(restored.tools.map(t => t.name), ['read'])
+  // Declared tools are kept; only the missing core agent tools are appended.
+  const shaped = maybeEnsureAgentTools(prepareZenContext(restored))
+  assert.deepEqual(shaped.tools.map(t => t.name), ['read', 'bash', 'edit', 'glob', 'grep'])
+  assert.equal(shaped.tools[0], read)
+})
+
+test('0.87 boundary: tool-less transcript still gets the five core agent tools', () => {
+  const shaped = maybeEnsureAgentTools(prepareZenContext(transcriptToContext({ messages: [] })))
+  assert.deepEqual(shaped.tools.map(t => t.name), CORE)
 })

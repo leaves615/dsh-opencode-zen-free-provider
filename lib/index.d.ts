@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm';
 import z from '@deepseek-ai/schemastery';
-import { type Context as PiContext, type Model, type SimpleStreamOptions } from '@earendil-works/pi-ai';
+import { type Context as PiContext, type Model, type SimpleStreamOptions, type TranscriptContext } from '@earendil-works/pi-ai';
 export declare const name = "opencode-zen-free-provider";
 export declare const inject: string[];
 export declare const opencodeUserAgentFor: (version: string) => string;
@@ -29,5 +29,6 @@ export declare const maybeStripResponsesInclude: (options: SimpleStreamOptions, 
 export declare const ensureAgentTools: (context: PiContext) => PiContext;
 export declare const maybeEnsureAgentTools: (context: PiContext) => PiContext;
 type ZenApi = 'openai-completions' | 'openai-responses';
+export declare const transcriptToContext: (context: TranscriptContext) => PiContext;
 export declare function apply(ctx: Context, config: Config): Promise<void>;
 export {};

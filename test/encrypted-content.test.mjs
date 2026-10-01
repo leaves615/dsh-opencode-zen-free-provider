@@ -127,34 +127,28 @@ test('switch off: prepare keeps ciphertext, include untouched', async () => {
   assert.notEqual(maybeStripResponsesInclude(options, true), options)
 })
 
-test('switch follows settings off/on through apply', async () => {
+test('switch follows settings through remount (0.2: plain config, no installSection)', async () => {
   const { apply, prepareZenContext } = await import('../lib/index.js')
-  let hooks
-  const settingsCtx = { settings: { installSection: (ctx, ns, schema, cfg, h) => { hooks = h } } }
+  const settingsCtx = { settings: { configure: () => {} }, effect: (fn) => fn() }
   const ctx = { get: () => undefined, inject: (deps, fn) => fn(settingsCtx), logger: { info: () => {}, warn: () => {} }, llm: { registerConfigurableProviders: () => {}, registerAdapter: () => {} } }
   const realFetch = globalThis.fetch
   globalThis.fetch = async () => new Response(JSON.stringify({ version: '9.9.9' }), { status: 200 })
   try {
-    await apply(ctx, {})
-    let current = {}
-    hooks.setSource(() => current)
-    hooks.onChange()
     const context = {
       messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'hmm', thinkingSignature: reasoningItem }] }],
     }
-    // Default (missing key) strips: module switch synced to true.
+    // Default (missing key) strips: module switch synced to true on mount.
+    await apply(ctx, {})
     assert.equal(prepareZenContext(context).messages[0].content.length, 0)
-    current = { stripReasoningEncryptedContent: false }
-    hooks.onChange()
+    // A settings edit remounts the plugin with the new section value.
+    await apply(ctx, { stripReasoningEncryptedContent: false })
     assert.equal(prepareZenContext(context).messages[0].content.length, 1)
-    current = { stripReasoningEncryptedContent: true }
-    hooks.onChange()
+    await apply(ctx, { stripReasoningEncryptedContent: true })
     assert.equal(prepareZenContext(context).messages[0].content.length, 0)
+    // Leave the module switch on for other tests (import order independent).
+    await apply(ctx, {})
   } finally {
     globalThis.fetch = realFetch
-    // Leave the module switch on for other tests (import order independent).
-    hooks.setSource(() => ({}))
-    hooks.onChange()
   }
 })
 

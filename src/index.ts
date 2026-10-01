@@ -7,7 +7,7 @@ import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { createHash, randomBytes } from 'node:crypto'
-import { createProvider, type AuthContext, type Context as PiContext, type CredentialStore, type Model, type SimpleStreamOptions, type ThinkingLevelMap, type ProviderStreams, type Tool, type TSchema } from '@earendil-works/pi-ai'
+import { createProvider, getCurrentTools, type AuthContext, type Context as PiContext, type CredentialStore, type Model, type SimpleStreamOptions, type ThinkingLevelMap, type ProviderStreams, type Tool, type TranscriptContext, type TSchema } from '@earendil-works/pi-ai'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 // Cloned (and minimized) from @earendil-works/pi-ai's openai-completions module.
 // See src/openai-completions.ts for the source URL + the only change (zenFetch).
@@ -309,18 +309,32 @@ const sanitizeStream = <S extends { push(event: unknown): void }>(stream: S): S 
 
 type ZenApi = 'openai-completions' | 'openai-responses'
 
+// pi-ai 0.87 normalizes the caller's Context into a TranscriptContext before
+// provider dispatch: tools move into the leading system message and the wire
+// object carries only messages. The cloned 0.84 transports below still read
+// context.tools, so restore the tool list with the canonical reader before
+// the strip/shape pipeline runs.
+export const transcriptToContext = (context: TranscriptContext): PiContext => ({
+  messages: context.messages,
+  tools: getCurrentTools(context.messages),
+})
+
+// Back to the wire shape: the brand is type-only (erased at runtime), and the
+// restored tools field is exactly what the cloned transports read.
+const toTranscript = (context: PiContext): TranscriptContext => context as unknown as TranscriptContext
+
 const zenStreamFor = (api: ZenApi): ProviderStreams => api === 'openai-responses'
   ? {
-    stream: (model: Model<'openai-responses'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piResponsesStream({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), maybeStripResponsesInclude(options))),
-    streamSimple: (model: Model<'openai-responses'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piResponsesStreamSimple({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), maybeStripResponsesInclude(options))),
+    stream: (model: Model<'openai-responses'>, context: TranscriptContext, options: SimpleStreamOptions) =>
+      sanitizeStream(piResponsesStream({ ...model, headers: zenApiHeaders(model, options) }, toTranscript(maybeEnsureAgentTools(prepareZenContext(transcriptToContext(context)))), maybeStripResponsesInclude(options))),
+    streamSimple: (model: Model<'openai-responses'>, context: TranscriptContext, options: SimpleStreamOptions) =>
+      sanitizeStream(piResponsesStreamSimple({ ...model, headers: zenApiHeaders(model, options) }, toTranscript(maybeEnsureAgentTools(prepareZenContext(transcriptToContext(context)))), maybeStripResponsesInclude(options))),
   } as unknown as ProviderStreams
   : {
-    stream: (model: Model<'openai-completions'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piAgentStream({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), options)),
-    streamSimple: (model: Model<'openai-completions'>, context: PiContext, options: SimpleStreamOptions) =>
-      sanitizeStream(piAgentStreamSimple({ ...model, headers: zenApiHeaders(model, options) }, maybeEnsureAgentTools(prepareZenContext(context)), options)),
+    stream: (model: Model<'openai-completions'>, context: TranscriptContext, options: SimpleStreamOptions) =>
+      sanitizeStream(piAgentStream({ ...model, headers: zenApiHeaders(model, options) }, toTranscript(maybeEnsureAgentTools(prepareZenContext(transcriptToContext(context)))), options)),
+    streamSimple: (model: Model<'openai-completions'>, context: TranscriptContext, options: SimpleStreamOptions) =>
+      sanitizeStream(piAgentStreamSimple({ ...model, headers: zenApiHeaders(model, options) }, toTranscript(maybeEnsureAgentTools(prepareZenContext(transcriptToContext(context)))), options)),
   }
 
 const zenApi: Partial<Record<ZenApi, ProviderStreams>> = {
@@ -434,20 +448,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   installZenUserAgent(opencodeUserAgent)
   installZenUserAgentResponses(opencodeUserAgent)
 
-  // Sync the module-level strip switch with settings. Default true so a
-  // missing key (e.g. an old settings snapshot) keeps stripping on.
-  const syncStripSwitch = (cfg: Config): void => {
-    stripEncryptedContentEnabled = cfg.stripReasoningEncryptedContent ?? true
-  }
-  syncStripSwitch(config)
+  // DSH 0.2 removed settings.installSection: plain (non-Volatile) Config
+  // fields apply on mount, and a settings edit remounts the plugin, so the
+  // module-level switch is synced once here. Default true so a missing key
+  // (e.g. an old settings snapshot) keeps stripping on.
+  stripEncryptedContentEnabled = config.stripReasoningEncryptedContent ?? true
 
-  let current: () => Config = () => config
   // Outside the settings-backed config, so a settings snapshot cannot clobber a
   // scan.
   let scanned: Model<ZenApi>[] = []
 
+  // The profile entry id owns the directory listing; fall back to the bundle
+  // id. Fiber.entry is runtime-internal (untyped), so read it structurally.
+  const settingsNs = (ctx.fiber as unknown as { entry?: { options?: { id?: string } } } | undefined)?.entry?.options?.id ?? NS
+
   const buildProfiles = (): ReadonlyMap<string, ResolvedPiAiProviderProfile> => {
-    const opts = current()
+    const opts = config
     const piProvider = createProvider<ZenApi>({
       id: PROVIDER,
       name: 'OpenCodeZenFree',
@@ -499,20 +515,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
 
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: DISPLAY_NAME, settingsNs: NS, settingsPath: [] },
+    { provider: PROVIDER, displayName: DISPLAY_NAME, settingsNs, settingsPath: [] },
   ])
   ctx.llm.registerAdapter([PROVIDER], adapter)
 
+  // Settings page policy only, registered last: a failure here must never kill
+  // the provider registration above (a host without the settings service, or a
+  // duplicate page policy on remount, only loses the auto-generated page).
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source) => {
-        current = source
-        syncStripSwitch(source())
-      },
-      onChange: () => {
-        syncStripSwitch(current())
-        profiles = buildProfiles()
-      },
+    settingsCtx.effect(() => {
+      try {
+        return settingsCtx.settings.configure({ auto: true }, ctx.fiber)
+      } catch (error) {
+        ctx.logger.warn('[%s] settings page unavailable: %s', name, errorChain(error))
+        return () => {}
+      }
     })
   })
 
