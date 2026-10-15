@@ -16,6 +16,7 @@ import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 // Runtime behavior is identical; only the (private) class identity differs.
 import { stream as _piAgentStream, streamSimple as _piAgentStreamSimple, installZenUserAgent } from './openai-completions.js'
 import { stream as _piResponsesStream, streamSimple as _piResponsesStreamSimple, installZenUserAgent as installZenUserAgentResponses } from './openai-responses.js'
+import { OFFICIAL_TOOL_DEFS } from './opencode-tools.js'
 const piAgentStream = _piAgentStream as unknown as ProviderStreams['stream']
 const piAgentStreamSimple = _piAgentStreamSimple as unknown as ProviderStreams['streamSimple']
 const piResponsesStream = _piResponsesStream as unknown as ProviderStreams['stream']
@@ -27,18 +28,26 @@ export const inject = ['llm']
 const PROVIDER = name
 const DISPLAY_NAME = 'OpenCode Zen Free'
 const NS = 'opencode-zen-free-provider'
-/** Latest CLI version, read off unpkg's `@latest` redirect via the package's own `package.json`. */
-const OPENCODE_VERSION_URL = 'https://unpkg.com/opencode-ai@latest/package.json'
-const OPENCODE_VERSION_FALLBACK = '1.18.18'
-// Remaining tokens of the opencode CLI User-Agent fingerprint. Deliberately
-// spoofed: dsh runs on Node, but the Zen free-tier gate expects the Bun/AI SDK
-// identity opencode ships. Bump alongside the resolved CLI version.
-// Verified against opencode 1.18.31 binary: provider-utils is 4.0.23, bun 1.3.14.
-const OPENCODE_AI_SDK_PROVIDER_UTILS_VERSION = '4.0.23'
-const OPENCODE_BUN_VERSION = '1.3.14'
+// Inference moved to a new backend on 2026-10-14
+// (`https://opencode.ai/inference/openai`, was `https://opencode.ai/zen`)
+// and the free-tier gate now wants the 2.x CLI fingerprint
+// `opencode/<channel>/<version>/cli`. The npm `opencode-ai` feed still
+// tracks the 1.x line, so there is no feed to resolve a 2.x version from;
+// like opencode2api (internal/httpx/client.go) this pins the release.
+// Upstream does not validate the version number itself.
+const OPENCODE_VERSION = '2.0.29'
+const OPENCODE_CHANNEL = 'latest'
 
 export const opencodeUserAgentFor = (version: string): string =>
-  `opencode/${version} ai-sdk/provider-utils/${OPENCODE_AI_SDK_PROVIDER_UTILS_VERSION} runtime/bun/${OPENCODE_BUN_VERSION}`
+  `opencode/${OPENCODE_CHANNEL}/${version}/cli`
+
+export const OPENCODE_USER_AGENT = opencodeUserAgentFor(OPENCODE_VERSION)
+
+// Chat/completions + responses traffic goes to the inference backend. The
+// models listing is NOT exposed there, so the catalog sync below still reads
+// the legacy Zen console origin.
+const ZEN_INFERENCE_BASE_URL = 'https://opencode.ai/inference/openai/v1'
+const ZEN_MODELS_URL = 'https://opencode.ai/zen/v1/models'
 
 /** Envelope types that must stay AUTH-classified instead of being rewritten. */
 const AUTH_ERROR_TYPES = new Set(['AuthError', 'authentication_error', 'invalid_api_key', 'unauthorized'])
@@ -57,15 +66,6 @@ export const Config: z<Config> = z.object({
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
-
-const resolveOpenCodeVersion = async (): Promise<string> => {
-  try {
-    const payload = await fetchJson(OPENCODE_VERSION_URL, { accept: 'application/json' })
-    return typeof payload.version === 'string' && payload.version.length > 0 ? payload.version : OPENCODE_VERSION_FALLBACK
-  } catch {
-    return OPENCODE_VERSION_FALLBACK
-  }
-}
 
 const OPENCODE_ID_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 
@@ -130,20 +130,24 @@ export const opencodeSessionId = (sessionId: string): string => {
 
 export const zenApiHeaders = (model: Pick<Model<ZenApi>, 'headers'>, options: SimpleStreamOptions) => {
   const sessionId = options.sessionId ?? 'dsh-session-unknown'
-  // Match real opencode CLI headers exactly (captured from 1.18.31 binary):
+  // Match the 2.x opencode CLI header set exactly:
   // - no HTTP-Referer (actively stripped: model defs may still carry one)
-  // - accept: */*
-  // - accept-encoding: gzip, deflate, br, zstd
-  // - x-opencode-* headers
+  // - both session headers carry the same descending id (required as a pair
+  //   since 2026-10-14; either one missing is a 403 FreeTierError)
+  // - x-opencode-request is NEVER sent: the gate rejects the correlation
+  //   header with 403 since 2026-10-14, tracing stays local
+  // - x-opencode-project stays the literal "global" every official client
+  //   sends (any non-canonical value passes; canonical prj_* ids 403)
   const { 'HTTP-Referer': _droppedReferer, ...modelHeaders } = model.headers ?? {}
   void _droppedReferer
+  const minted = opencodeSessionId(sessionId)
   return {
     ...modelHeaders,
     accept: '*/*',
     'accept-encoding': 'gzip, deflate, br, zstd',
     'x-opencode-project': 'global',
-    'x-opencode-session': opencodeSessionId(sessionId),
-    'x-opencode-request': opencodeRequestId(),
+    'x-opencode-session': minted,
+    'x-opencode-session-id': minted,
     'x-opencode-client': 'cli',
   }
 }
@@ -246,24 +250,56 @@ export const maybeStripResponsesInclude = (options: SimpleStreamOptions, enabled
   enabled ? withStrippedResponsesInclude(options) : options
 
 // The anonymous free tier only serves agent-shaped streaming requests: the
-// cloned transports always send `stream: true`, but the core agent tools must
-// also be present — anything else is rejected with 403 FreeTierError. Mirror
-// opencode2api: synthesize minimal defs for whichever core tools the caller
-// did not declare; declared tools are left untouched. Key-tier requests keep
-// their original bodies (gated by userKeyPresent below).
-const ANONYMOUS_CORE_TOOLS = ['bash', 'edit', 'glob', 'grep', 'read'] as const
+// cloned transports always send `stream: true`, and tools must be present —
+// a tool-less request is rejected with 403 FreeTierError. Since 2026-10-14
+// name presence is not enough: the gate compares every recognised tool's
+// description and parameter schema against the official CLI definitions
+// byte-for-byte, so a synthesised stand-in 403s even under the right name.
+// Mirror opencode2api: recognised names always ship the genuine definitions
+// (OFFICIAL_TOOL_DEFS); unknown names pass through exactly as declared.
+// Key-tier requests keep their original bodies (gated by userKeyPresent below).
+const ANONYMOUS_CORE_TOOLS = ['shell', 'edit', 'glob', 'grep', 'read'] as const
 
-const agentToolFor = (name: string): Tool => ({
-  name,
-  description: `Agent tool ${name}`,
-  parameters: { type: 'object', properties: {} } as unknown as TSchema,
-})
+// Upstream recognises the pre-2.x 'bash' spelling and validates it. There is
+// no genuine bash definition to ship (opencode2api never had one either), but
+// a bash entry carrying the official shell definition passes (verified live),
+// so bash is treated as an alias of shell on the wire.
+const officialToolDefFor = (name: string): { description: string; parameters: unknown } | undefined => {
+  if (name === 'bash') return OFFICIAL_TOOL_DEFS.shell
+  return OFFICIAL_TOOL_DEFS[name]
+}
+
+const agentToolFor = (name: string): Tool => {
+  const def = officialToolDefFor(name)
+  return {
+    name,
+    description: def?.description ?? `Agent tool ${name}`,
+    parameters: (def?.parameters ?? { type: 'object', properties: {} }) as unknown as TSchema,
+  }
+}
+
+// A declared tool already carrying the genuine definition keeps its object
+// identity, so a fully genuine context passes through untouched.
+const needsGenuineDef = (tool: Tool, def: { description: string; parameters: unknown }): boolean =>
+  tool.description !== def.description || !deepEqualJson(tool.parameters, def.parameters)
 
 export const ensureAgentTools = (context: PiContext): PiContext => {
-  const present = new Set((context.tools ?? []).map(tool => tool.name))
+  const tools = context.tools ?? []
+  let changed = false
+  const next = tools.map((tool) => {
+    const def = officialToolDefFor(tool.name)
+    if (def === undefined || !needsGenuineDef(tool, def)) return tool
+    changed = true
+    return { ...tool, description: def.description, parameters: def.parameters as unknown as TSchema }
+  })
+  const present = new Set(next.map(tool => tool.name))
   const missing = ANONYMOUS_CORE_TOOLS.filter(name => !present.has(name))
-  if (missing.length === 0) return context
-  return { ...context, tools: [...(context.tools ?? []), ...missing.map(agentToolFor)] }
+  if (missing.length > 0) {
+    next.push(...missing.map(agentToolFor))
+    changed = true
+  }
+  if (!changed) return context
+  return { ...context, tools: next }
 }
 
 // Latched by resolveApiKey once a real user credential resolves: from then on
@@ -272,6 +308,68 @@ let userKeyPresent = false
 
 export const maybeEnsureAgentTools = (context: PiContext): PiContext =>
   userKeyPresent ? context : ensureAgentTools(context)
+
+// The wire tools above wear official OpenCode schemas, but the harness
+// executes calls against its own schemas (snake_case file_path, a required
+// human description on bash, skill by name instead of id). Rewrite official
+// args back to harness args on the way out, in the stream events below.
+// 'shell' has no harness counterpart: the injected shell tool and the
+// wire-level bash alias both run through the harness bash tool. Mappers accept
+// both shapes so a block already rewritten (the done message replays the same
+// block objects as toolcall_end) is left stable. History needs no mapping:
+// the gate does not inspect tool calls inside messages (verified live).
+const synthBashDescription = (command: unknown): string => {
+  if (typeof command !== 'string' || command.length === 0) return 'Run shell command'
+  const firstLine = command.split('\n', 1)[0]
+  return `Run shell command: ${firstLine.slice(0, 120)}`
+}
+
+const remapShellArgs = (args: Record<string, unknown>): Record<string, unknown> => {
+  const { command, timeout, workdir, background, description, ...rest } = args
+  const out: Record<string, unknown> = { ...rest }
+  if (command !== undefined) out.command = command
+  out.description = typeof description === 'string' && description.length > 0
+    ? description
+    : synthBashDescription(command)
+  if (timeout !== undefined) out.timeoutMs = timeout
+  if (workdir !== undefined) out.workdir = workdir
+  if (background !== undefined) out.run_in_background = background
+  return out
+}
+
+const renameArgs = (args: Record<string, unknown>, mapping: Record<string, string>): Record<string, unknown> => {
+  const out: Record<string, unknown> = { ...args }
+  for (const [from, to] of Object.entries(mapping)) {
+    if (out[from] !== undefined) {
+      out[to] = out[from]
+      delete out[from]
+    }
+  }
+  return out
+}
+
+export const remapZenToolCall = (name: string, args: unknown): { name: string; args: unknown } => {
+  if (!isRecord(args)) return { name, args }
+  switch (name) {
+    case 'shell':
+      return { name: 'bash', args: remapShellArgs(args) }
+    case 'bash':
+      return { name, args: remapShellArgs(args) }
+    case 'edit':
+      return { name, args: renameArgs(args, { path: 'file_path', oldString: 'old_string', newString: 'new_string', replaceAll: 'replace_all' }) }
+    case 'read':
+      return { name, args: renameArgs(args, { path: 'file_path' }) }
+    case 'write':
+      return { name, args: renameArgs(args, { path: 'file_path' }) }
+    case 'skill': {
+      const out: Record<string, unknown> = { ...args }
+      if (typeof out.id === 'string') out.name = out.id
+      return { name, args: out }
+    }
+    default:
+      return { name, args }
+  }
+}
 
 // Replayed thinking blocks carry no wire signature; marking them
 // `reasoning_content` keeps the transport from mangling history. Never gated on
@@ -324,12 +422,34 @@ const PI_AUTH: { credentials: CredentialStore, authContext: AuthContext } = {
   authContext: { env: async () => undefined, fileExists: async () => false },
 }
 
+// Rewrite official tool-call args back to harness args in live events: the
+// completions transport pushes toolcall_end with the finished block, and both
+// transports replay the same blocks in the done message.
+export const remapEventToolCalls = (event: unknown): void => {
+  if (!isRecord(event)) return
+  if (event.type === 'toolcall_end' && isRecord(event.toolCall) && typeof event.toolCall.name === 'string') {
+    const remapped = remapZenToolCall(event.toolCall.name, event.toolCall.arguments)
+    event.toolCall.name = remapped.name
+    event.toolCall.arguments = remapped.args
+    return
+  }
+  if (event.type === 'done' && isRecord(event.message) && Array.isArray(event.message.content)) {
+    for (const block of event.message.content) {
+      if (!isRecord(block) || block.type !== 'toolCall' || typeof block.name !== 'string') continue
+      const remapped = remapZenToolCall(block.name, block.arguments)
+      block.name = remapped.name
+      block.arguments = remapped.args
+    }
+  }
+}
+
 const sanitizeStream = <S extends { push(event: unknown): void }>(stream: S): S => {
   const originalPush = stream.push.bind(stream)
   stream.push = (event: unknown) => {
     if (isRecord(event) && event.type === 'error' && isRecord(event.error) && typeof event.error.errorMessage === 'string') {
       event.error.errorMessage = rewriteRefusalMessage(event.error.errorMessage)
     }
+    remapEventToolCalls(event)
     originalPush(event)
   }
   return stream
@@ -455,7 +575,7 @@ function buildModels(
         name: typeof metadata.name === 'string' ? metadata.name : id,
         api,
         provider: PROVIDER,
-        baseUrl: 'https://opencode.ai/zen/v1',
+        baseUrl: ZEN_INFERENCE_BASE_URL,
         headers: { 'User-Agent': userAgent },
         reasoning: controllable,
         ...(controllable ? { thinkingLevelMap: reasoningMapFor(levels, api) } : {}),
@@ -471,10 +591,8 @@ function buildModels(
 
 export async function apply(ctx: Context, config: Config): Promise<void> {
   // One-time: the Zen user-agent the cloned transports force on every request.
-  const opencodeVersion = await resolveOpenCodeVersion()
-  const opencodeUserAgent = opencodeUserAgentFor(opencodeVersion)
-  installZenUserAgent(opencodeUserAgent)
-  installZenUserAgentResponses(opencodeUserAgent)
+  installZenUserAgent(OPENCODE_USER_AGENT)
+  installZenUserAgentResponses(OPENCODE_USER_AGENT)
 
   // DSH 0.2 removed settings.installSection: plain (non-Volatile) Config
   // fields apply on mount, and a settings edit remounts the plugin, so the
@@ -495,7 +613,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const piProvider = createProvider<ZenApi>({
       id: PROVIDER,
       name: 'OpenCodeZenFree',
-      baseUrl: 'https://opencode.ai/zen/v1',
+      baseUrl: ZEN_INFERENCE_BASE_URL,
       auth: { apiKey: { name: 'OpenCodeZenFree', resolve: ({ credential }) => Promise.resolve({
         auth: credential?.key === undefined ? {} : { apiKey: credential.key },
         source: 'OpenCodeZenFree',
@@ -565,8 +683,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // upstream must not kill the plugin.
   async function sync(): Promise<void> {
     const [zen, modelsDev] = await Promise.all([
-      fetchJson('https://opencode.ai/zen/v1/models', {
-        'User-Agent': opencodeUserAgent,
+      fetchJson(ZEN_MODELS_URL, {
+        'User-Agent': OPENCODE_USER_AGENT,
         accept: 'application/json',
       }),
       fetchJson('https://models.dev/api.json', { accept: 'application/json' }),
@@ -575,7 +693,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (!isRecord(modelsDev.opencode) || !isRecord(modelsDev.opencode.models)) {
       throw new Error('models.dev: no "opencode" provider')
     }
-    const next = buildModels(zen.data, modelsDev.opencode.models, opencodeUserAgent)
+    const next = buildModels(zen.data, modelsDev.opencode.models, OPENCODE_USER_AGENT)
     if (next.length === 0) {
       throw new Error('no OpenCode Zen free models resolved; keeping the previous catalog')
     }

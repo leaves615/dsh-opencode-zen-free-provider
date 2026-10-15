@@ -1,15 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { opencodeRequestId, opencodeSessionId, opencodeUserAgentFor, zenApiHeaders } from '../lib/index.js'
+import { OPENCODE_USER_AGENT, opencodeRequestId, opencodeSessionId, opencodeUserAgentFor, zenApiHeaders } from '../lib/index.js'
 
 // opencode CLI id shape: `ses_`/`msg_` + 12 lowercase hex + 14 base62 chars.
 const ID_SHAPE = /^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 
-test('User-Agent reproduces the opencode CLI fingerprint', () => {
-  assert.equal(
-    opencodeUserAgentFor('1.18.31'),
-    'opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
-  )
+test('User-Agent reproduces the opencode 2.x CLI fingerprint', () => {
+  assert.equal(opencodeUserAgentFor('2.0.29'), 'opencode/latest/2.0.29/cli')
+  assert.equal(OPENCODE_USER_AGENT, 'opencode/latest/2.0.29/cli')
 })
 
 test('msg_ ids follow the opencode shape and are fresh per call', () => {
@@ -68,7 +66,7 @@ test('an official opencode session id passes through untouched', () => {
 })
 
 test('zenApiHeaders carries the full opencode request fingerprint', () => {
-  const userAgent = opencodeUserAgentFor('1.18.31')
+  const userAgent = opencodeUserAgentFor('2.0.29')
   // Even if a model def still carries a referer, the wire headers must not.
   const model = { headers: { 'User-Agent': userAgent, 'HTTP-Referer': 'https://opencode.ai' } }
   const headers = zenApiHeaders(model, { sessionId: 'ses_x' })
@@ -79,6 +77,8 @@ test('zenApiHeaders carries the full opencode request fingerprint', () => {
   assert.equal(headers['x-opencode-client'], 'cli')
   assert.equal(headers['x-opencode-project'], 'global')
   assert.equal(headers['x-opencode-session'], opencodeSessionId('ses_x'))
-  assert.match(headers['x-opencode-request'], ID_SHAPE)
-  assert.notEqual(headers['x-opencode-request'], opencodeRequestId())
+  // Both session headers carry the same id; the correlation header is never
+  // sent (the gate rejects x-opencode-request with 403 since 2026-10-14).
+  assert.equal(headers['x-opencode-session-id'], headers['x-opencode-session'])
+  assert.equal(headers['x-opencode-request'], undefined)
 })

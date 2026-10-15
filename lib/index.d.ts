@@ -5,6 +5,7 @@ import { type Context as PiContext, type Model, type SimpleStreamOptions, type T
 export declare const name = "opencode-zen-free-provider";
 export declare const inject: string[];
 export declare const opencodeUserAgentFor: (version: string) => string;
+export declare const OPENCODE_USER_AGENT: string;
 export interface Config {
     /** Provider-owned model-request retry policy; omission uses normal defaults. */
     retryPolicy?: RetryPolicyConfig;
@@ -19,7 +20,7 @@ export declare const zenApiHeaders: (model: Pick<Model<ZenApi>, "headers">, opti
     'accept-encoding': string;
     'x-opencode-project': string;
     'x-opencode-session': string;
-    'x-opencode-request': string;
+    'x-opencode-session-id': string;
     'x-opencode-client': string;
 };
 export declare const stripReasoningEncryptedContent: (context: PiContext) => PiContext;
@@ -28,6 +29,11 @@ export declare const prepareZenContext: (context: PiContext, enabled?: boolean) 
 export declare const maybeStripResponsesInclude: (options: SimpleStreamOptions, enabled?: boolean) => SimpleStreamOptions;
 export declare const ensureAgentTools: (context: PiContext) => PiContext;
 export declare const maybeEnsureAgentTools: (context: PiContext) => PiContext;
+export declare const remapZenToolCall: (name: string, args: unknown) => {
+    name: string;
+    args: unknown;
+};
+export declare const remapEventToolCalls: (event: unknown) => void;
 type ZenApi = 'openai-completions' | 'openai-responses';
 export declare const transcriptToContext: (context: TranscriptContext) => PiContext;
 export declare function apply(ctx: Context, config: Config): Promise<void>;
